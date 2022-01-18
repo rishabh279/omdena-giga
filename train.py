@@ -238,3 +238,95 @@ def get_test_transform():
             A.Resize(height=512, width=512, p=1.0),
             ToTensorV2(p=1.0)], 
             p=1.0)
+
+#TRAIN_ROOT_PATH = '../input/school-data2/school_data/schools_annotated'
+
+class DatasetRetriever(Dataset):
+
+    def __init__(self, marking, image_ids, TRAIN_ROOT_PATH, transforms=None, test=False):
+        super().__init__()
+        self.image_ids = image_ids
+        self.marking = marking
+        self.transforms = transforms
+        self.test = test
+        self.TRAIN_ROOT_PATH = TRAIN_ROOT_PATH
+        
+        
+    def load_image_and_boxes(self, index):
+        image_id = self.image_ids[index]
+        image = cv2.imread(f'{self.TRAIN_ROOT_PATH}/{image_id}', cv2.IMREAD_COLOR).copy()
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32)
+        image /= 255.0
+        records = self.marking[self.marking['image_id'] == image_id]
+        boxes = records[['x_min', 'y_min', 'x_max', 'y_max']].values
+        labels = records['class_id'].tolist()
+        resize_transform = A.Compose([A.Resize(height=512, width=512, p=1.0)], 
+                                    p=1.0, 
+                                    bbox_params=A.BboxParams(
+                                        format='pascal_voc',
+                                        min_area=0.1, 
+                                        min_visibility=0.1,
+                                        label_fields=['labels'])
+                                    )
+
+        resized = resize_transform(**{
+                'image': image,
+                'bboxes': boxes,
+                'labels': labels
+            })
+
+        resized_bboxes = np.vstack((list(bx) for bx in resized['bboxes']))
+        return resized['image'], resized_bboxes, resized['labels']
+#         final_bboxes = np.vstack((list(bx) for bx in boxes))
+#         return image, final_bboxes, labels
+
+        
+    def __getitem__(self, index: int):
+        image_id = self.image_ids[index]
+    
+        image, boxes, labels = self.load_image_and_boxes(index)
+        ## To prevent ValueError: y_max is less than or equal to y_min for bbox from albumentations bbox_utils
+        labels = np.array(labels, dtype=np.int).reshape(len(labels), 1)
+        combined = np.hstack((boxes.astype(np.int), labels))
+        combined = combined[np.logical_and(combined[:,2] > combined[:,0],
+                                                          combined[:,3] > combined[:,1])]
+        boxes = combined[:, :4]
+        labels = combined[:, 4].tolist()
+        
+        target = {}
+        target['boxes'] = boxes
+        target['labels'] = torch.tensor(labels)
+        target['image_id'] = torch.tensor([index])
+        if self.transforms:
+            for i in range(10):
+                sample = self.transforms(**{
+                    'image': image,
+                    'bboxes': target['boxes'],
+                    'labels': labels
+                })
+                if len(sample['bboxes']) > 0:
+                    image = sample['image']
+                    target['boxes'] = torch.stack(tuple(map(torch.tensor, zip(*sample['bboxes'])))).permute(1, 0)
+                    target['boxes'][:,[0,1,2,3]] = target['boxes'][:,[1,0,3,2]]  ## ymin, xmin, ymax, xmax
+                    break
+            
+            ## Handling case where no valid bboxes are present
+            if len(target['boxes'])==0 or i==9:
+                return None
+            else:
+                ## Handling case where augmentation and tensor conversion yields no valid annotations
+                try:
+                    assert torch.is_tensor(image), f"Invalid image type:{type(image)}"
+                    assert torch.is_tensor(target['boxes']), f"Invalid target type:{type(target['boxes'])}"
+                except Exception as E:
+                    print("Image skipped:", E)
+                    return None      
+
+        return image, target, image_id
+
+    def __len__(self) -> int:
+        return self.image_ids.shape[0]
+    
+    
+
+
